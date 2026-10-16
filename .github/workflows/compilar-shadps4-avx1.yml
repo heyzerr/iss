@@ -1,0 +1,67 @@
+
+name: Compilar shadPS4 AVX1
+
+on:
+  workflow_dispatch:
+
+jobs:
+  compilar:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Baixar shadPS4
+        shell: pwsh
+        run: |
+          git clone --depth 1 --recursive https://github.com/shadps4-emu/shadPS4.git shadPS4
+          if ($LASTEXITCODE -ne 0) { throw "Falha no download" }
+
+      - name: Preparar Visual Studio
+        uses: egor-tensin/vs-shell@v2
+        with:
+          arch: x64
+
+      - name: Aplicar patch AVX1
+        shell: pwsh
+        run: |
+          $file = "shadPS4/CMakeLists.txt"
+          $content = [IO.File]::ReadAllText($file)
+          $old = 'add_compile_options(-march=x86-64-v3)'
+          $new = 'add_compile_options(-march=x86-64-v2 -mavx -mno-avx2 -mno-fma -mno-bmi -mno-bmi2)'
+          if (-not $content.Contains($old)) {
+            throw "Alvo original nao encontrado"
+          }
+          $content = $content.Replace($old, $new)
+          [IO.File]::WriteAllText($file, $content)
+          Write-Host "Patch AVX1 aplicado"
+
+      - name: Configurar compilacao
+        shell: pwsh
+        run: |
+          cmake -S shadPS4 -B shadPS4/build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=clang-cl `
+            -DCMAKE_CXX_COMPILER=clang-cl `
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=OFF `
+            -DENABLE_UPDATER=OFF `
+            -DENABLE_TESTS=OFF
+          if ($LASTEXITCODE -ne 0) { throw "Erro no CMake" }
+
+      - name: Compilar shadPS4
+        shell: pwsh
+        run: |
+          cmake --build shadPS4/build --config Release --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw "Erro na compilacao" }
+
+      - name: Preparar resultado
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path pacote | Out-Null
+          Copy-Item shadPS4/build/shadPS4.exe pacote/shadPS4.exe
+
+      - name: Disponibilizar download
+        uses: actions/upload-artifact@v4
+        with:
+          name: shadPS4-AVX1-Xeon
+          path: pacote/
+          if-no-files-found: error
