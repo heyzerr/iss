@@ -1,5 +1,4 @@
-
-name: Compilar shadPS4 AVX1
+name: shadPS4 AVX1 BMI1 - teste V2
 
 on:
   workflow_dispatch:
@@ -8,32 +7,116 @@ jobs:
   compilar:
     runs-on: windows-latest
     timeout-minutes: 120
-
     steps:
-      - name: Baixar shadPS4
+      - name: Baixar shadPS4 oficial
         shell: pwsh
         run: |
           git clone --depth 1 --recursive https://github.com/shadps4-emu/shadPS4.git shadPS4
-          if ($LASTEXITCODE -ne 0) { throw "Falha no download" }
+          if ($LASTEXITCODE -ne 0) { throw 'Falha ao baixar fonte' }
 
       - name: Preparar Visual Studio
         uses: egor-tensin/vs-shell@v2
         with:
           arch: x64
 
-      - name: Aplicar patch AVX1
+      - name: Remover alvo AVX2 do compilador
         shell: pwsh
         run: |
-          $file = "shadPS4/CMakeLists.txt"
-          $content = [IO.File]::ReadAllText($file)
+          $file = 'shadPS4/CMakeLists.txt'
+          $src = [IO.File]::ReadAllText($file)
           $old = 'add_compile_options(-march=x86-64-v3)'
           $new = 'add_compile_options(-march=x86-64-v2 -mavx -mno-avx2 -mno-fma -mno-bmi -mno-bmi2)'
-          if (-not $content.Contains($old)) {
-            throw "Alvo original nao encontrado"
+          if (-not $src.Contains($old)) { throw 'Opcao original nao encontrada: source mudou' }
+          [IO.File]::WriteAllText($file, $src.Replace($old, $new))
+
+      - name: Adicionar emulacao experimental BMI1 BEXTR
+        shell: pwsh
+        run: |
+          $file = 'shadPS4/src/core/cpu_patches.cpp'
+          $src = [IO.File]::ReadAllText($file)
+          $anchor = 'static bool PatchesIllegalInstructionHandler(void* context) {'
+          $callAnchor = '                const auto disassembled = Common::Decoder::Instance()->disassembleInst('
+          if (-not $src.Contains($anchor) -or -not $src.Contains($callAnchor)) {
+            throw 'O codigo de cpu_patches.cpp mudou. Interrompendo sem aplicar patch incorreto.'
           }
-          $content = $content.Replace($old, $new)
-          [IO.File]::WriteAllText($file, $content)
-          Write-Host "Patch AVX1 aplicado"
+          $helper = @'
+          #if defined(_WIN32)
+          // Emulacao experimental de BEXTR BMI1 (formas reg-reg-reg) no Windows.
+          // Permite prosseguir em CPUs anteriores a Haswell, como Xeon E5-2440.
+          static DWORD64* AVX1GetContextGpr(CONTEXT* ctx, ZydisRegister reg) {
+              const auto full = ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg);
+              switch (full) {
+              case ZYDIS_REGISTER_RAX: return &ctx->Rax;
+              case ZYDIS_REGISTER_RBX: return &ctx->Rbx;
+              case ZYDIS_REGISTER_RCX: return &ctx->Rcx;
+              case ZYDIS_REGISTER_RDX: return &ctx->Rdx;
+              case ZYDIS_REGISTER_RSI: return &ctx->Rsi;
+              case ZYDIS_REGISTER_RDI: return &ctx->Rdi;
+              case ZYDIS_REGISTER_RBP: return &ctx->Rbp;
+              case ZYDIS_REGISTER_RSP: return &ctx->Rsp;
+              case ZYDIS_REGISTER_R8: return &ctx->R8;
+              case ZYDIS_REGISTER_R9: return &ctx->R9;
+              case ZYDIS_REGISTER_R10: return &ctx->R10;
+              case ZYDIS_REGISTER_R11: return &ctx->R11;
+              case ZYDIS_REGISTER_R12: return &ctx->R12;
+              case ZYDIS_REGISTER_R13: return &ctx->R13;
+              case ZYDIS_REGISTER_R14: return &ctx->R14;
+              case ZYDIS_REGISTER_R15: return &ctx->R15;
+              default: return nullptr;
+              }
+          }
+          static bool AVX1EmulateBextr(void* context, const ZydisDecodedInstruction& instruction,
+                                       const ZydisDecodedOperand* operands) {
+              if (instruction.mnemonic != ZYDIS_MNEMONIC_BEXTR ||
+                  operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+                  operands[1].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+                  operands[2].type != ZYDIS_OPERAND_TYPE_REGISTER) {
+                  return false;
+              }
+              const unsigned bits = operands[0].size;
+              if (bits != 32 && bits != 64) return false;
+              auto* winCtx = static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord;
+              auto* dst = AVX1GetContextGpr(winCtx, operands[0].reg.value);
+              auto* src = AVX1GetContextGpr(winCtx, operands[1].reg.value);
+              auto* control = AVX1GetContextGpr(winCtx, operands[2].reg.value);
+              if (!dst || !src || !control) return false;
+              // Capturar ambos os operandos ANTES de modificar destino (aliasing).
+              const DWORD64 sourceVal = *src;
+              const DWORD64 controlVal = *control;
+              const unsigned start = static_cast<unsigned>(controlVal & 0xFFu);
+              const unsigned length = static_cast<unsigned>((controlVal >> 8) & 0xFFu);
+              DWORD64 result = 0;
+              if (length != 0 && start < bits) {
+                  const unsigned count = std::min(length, bits - start);
+                  const DWORD64 mask = (count == 64) ? ~DWORD64{0} : ((DWORD64{1} << count) - 1);
+                  result = (sourceVal >> start) & mask;
+              }
+              // Escrita em registrador de 32 bits no x86-64 zera a metade alta.
+              *dst = (bits == 32) ? (result & 0xFFFFFFFFull) : result;
+              // BEXTR: CF/OF/SF = 0, ZF = (resultado == 0); AF/PF indefinidos.
+              constexpr DWORD flagsToClear = (1u << 0) | (1u << 6) | (1u << 7) | (1u << 11);
+              winCtx->EFlags &= ~flagsToClear;
+              if (result == 0) winCtx->EFlags |= (1u << 6);
+              winCtx->Rip += instruction.length;
+              static std::atomic<int> reports{0};
+              if (reports.fetch_add(1) < 5) {
+                  LOG_WARNING(Core, "[AVX1 BMI1] BEXTR emulado em {:x}", winCtx->Rip - instruction.length);
+              }
+              return true;
+          }
+          #endif
+          '@
+          $src = $src.Replace($anchor, $helper + "`n" + $anchor)
+          $call = @'
+          #if defined(_WIN32)
+                          if (AVX1EmulateBextr(context, instruction, operands)) {
+                              return true;
+                          }
+          #endif
+          '@
+          $src = $src.Replace($callAnchor, $call + "`n" + $callAnchor)
+          [IO.File]::WriteAllText($file, $src)
+          Write-Host 'Suporte experimental BMI1 BEXTR (registros) instalado.'
 
       - name: Configurar compilacao
         shell: pwsh
@@ -45,23 +128,26 @@ jobs:
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=OFF `
             -DENABLE_UPDATER=OFF `
             -DENABLE_TESTS=OFF
-          if ($LASTEXITCODE -ne 0) { throw "Erro no CMake" }
+          if ($LASTEXITCODE -ne 0) { throw 'Erro de configuracao' }
 
-      - name: Compilar shadPS4
+      - name: Compilar shadPS4 V2
         shell: pwsh
         run: |
           cmake --build shadPS4/build --config Release --parallel 4
-          if ($LASTEXITCODE -ne 0) { throw "Erro na compilacao" }
+          if ($LASTEXITCODE -ne 0) { throw 'Erro de compilacao (veja log acima)' }
 
-      - name: Preparar resultado
+      - name: Preparar executavel
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path pacote | Out-Null
-          Copy-Item shadPS4/build/shadPS4.exe pacote/shadPS4.exe
+          $exe = 'shadPS4/build/shadPS4.exe'
+          if (-not (Test-Path $exe)) { throw 'Executavel nao encontrado' }
+          Copy-Item $exe pacote/shadPS4.exe
+          'BUILD EXPERIMENTAL: compilacao sem AVX2 + tratamento de BEXTR BMI1 (registros) no Windows. Nao garante compatibilidade total nem desempenho.' | Set-Content pacote/LEIA-ME.txt
 
-      - name: Disponibilizar download
+      - name: Disponibilizar download V2
         uses: actions/upload-artifact@v4
         with:
-          name: shadPS4-AVX1-Xeon
+          name: shadPS4-Xeon-BEXTR-V2-experimental
           path: pacote/
           if-no-files-found: error
